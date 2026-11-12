@@ -1,0 +1,106 @@
+#include <windows.h>
+#include <iostream>
+#include <string>
+
+struct Params {
+    int  id;
+    int  iterations;
+    bool sync;
+};
+
+static long long g_counter = 0;
+static CRITICAL_SECTION g_cs;
+
+DWORD WINAPI Worker(LPVOID p)
+{
+    Params* par = static_cast<Params*>(p);
+
+    std::cout << "T" << par->id
+        << " tid=" << GetCurrentThreadId()
+        << " cpu=" << GetCurrentProcessorNumber() << "\n";
+
+    for (int i = 0; i < par->iterations; ++i)
+    {
+        if (par->sync) {
+            EnterCriticalSection(&g_cs);
+            ++g_counter;
+            LeaveCriticalSection(&g_cs);
+        }
+        else {
+            ++g_counter;
+        }
+
+        if ((i & 0x3FFF) == 0)
+            SwitchToThread();
+    }
+
+    return 0;
+}
+
+int main(int argc, char* argv[])
+{
+    bool sync = false;
+    if (argc > 1 && argv[1][0] == 'n') sync = false;
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    const int ncpu = static_cast<int>(si.dwNumberOfProcessors);
+
+    const int N = 4;
+    const int ITER = 1000000;
+
+    SetProcessAffinityMask(GetCurrentProcess(), 0x0F);
+    InitializeCriticalSection(&g_cs);
+
+    HANDLE* handles = new HANDLE[N];
+    Params* params = new Params[N];
+
+    std::cout << "main tid=" << GetCurrentThreadId()
+        << ", cores=" << ncpu
+        << ", threads=" << N
+        << ", iter=" << ITER
+        << ", mode=" << (sync ? "sync" : "nosync") << "\n";
+
+    for (int i = 0; i < N; ++i)
+    {
+        params[i].id = i;
+        params[i].iterations = ITER;
+        params[i].sync = sync;
+
+        DWORD tid = 0;
+        handles[i] = CreateThread(nullptr, 0, Worker, &params[i],
+            CREATE_SUSPENDED, &tid);
+        if (handles[i] == nullptr) {
+            std::cerr << "CreateThread failed: " << GetLastError() << "\n";
+            return 1;
+        }
+
+        DWORD_PTR mask = DWORD_PTR(1) << (i % ncpu);
+        SetThreadAffinityMask(handles[i], mask);
+
+        ResumeThread(handles[i]);
+    }
+
+    WaitForMultipleObjects(N, handles, TRUE, INFINITE);
+
+    for (int i = 0; i < N; ++i)
+    {
+        DWORD code = 0;
+        GetExitCodeThread(handles[i], &code);
+        std::cout << "exit code T" << i << " = " << code << "\n";
+        CloseHandle(handles[i]);
+    }
+
+    const long long expected = static_cast<long long>(N) * ITER;
+    std::cout << "counter = " << g_counter
+        << "   expected = " << expected
+        << (g_counter == expected ? "   OK" : "   LOST")
+        << (g_counter == expected ? "" : " = " + std::to_string(expected - g_counter))
+        << "\n";
+
+    delete[] params;
+    delete[] handles;
+    DeleteCriticalSection(&g_cs);
+    system("pause");
+    return 0;
+}
